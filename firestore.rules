@@ -1,0 +1,122 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model & Access Architecture
+// ===============================================================
+//
+// Access Architecture:
+//   - Backend-Only Access: This service is a Node.js/TypeScript Express +
+//     Firebase Functions (2nd Gen) / Cloud Run webhook backend.
+//   - All Firestore reads and writes are executed exclusively by the
+//     privileged backend server using the Firebase Admin SDK
+//     (`firebase-admin/firestore`), which bypasses Firestore Security Rules.
+//   - Direct client-side (Web/Mobile SDK) access is strictly prohibited
+//     across the entire database (`allow read, write: if false;`).
+//
+// Collection: conversations
+// Document ID: {phoneNumber} (normalized E.164 phone number, e.g., +15551234567)
+// Fields:
+//   - phoneNumber: string (required, immutable, 1..20 chars) - Normalized sender phone number (PII)
+//   - messages: list<map> (required, max 100 items) - Sliding window of ChatMessage objects:
+//       - role: string ('user' | 'assistant')
+//       - content: string (1..5000 chars)
+//       - timestamp: int (epoch milliseconds)
+//   - createdAt: int (required, immutable, positive epoch ms) - Session creation timestamp
+//   - updatedAt: int (required, positive epoch ms) - Last message exchange timestamp
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the request is from an authenticated client
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if the authenticated user owns the resource by UID
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Verify UID hasn't been tampered with on create
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == request.auth.uid;
+    }
+
+    // Ensure uid field is not modified on update
+    function uidNotModified() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == resource.data.uid;
+    }
+
+    // Validate required fields exist on the incoming document
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate that the document contains only the allowed fields
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Validate string length bounds to prevent resource exhaustion / DoS
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    // Validate that a list is a list and enforces size limits
+    function isValidList(list, maxSize) {
+      return list is list && list.size() <= maxSize;
+    }
+
+    // Validate that immutable fields have not been modified on update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    // Validates the schema of a ConversationSession document
+    function isValidConversationSession(data, phoneNumber) {
+      return hasRequiredFields(['phoneNumber', 'messages', 'createdAt', 'updatedAt']) &&
+        hasOnlyAllowedFields(['phoneNumber', 'messages', 'createdAt', 'updatedAt']) &&
+        data.phoneNumber is string &&
+        data.phoneNumber == phoneNumber &&
+        data.phoneNumber.size() >= 1 &&
+        data.phoneNumber.size() <= 20 &&
+        isValidList(data.messages, 100) &&
+        data.createdAt is int &&
+        data.createdAt > 0 &&
+        data.updatedAt is int &&
+        data.updatedAt >= data.createdAt;
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // SMS Conversation Sessions:
+    // Contains PII (phone numbers and SMS message history).
+    // Restricted exclusively to the backend server via Firebase Admin SDK.
+    // All direct client SDK reads and writes are denied.
+    match /conversations/{phoneNumber} {
+      allow read, write: if false;
+    }
+
+    // Default Deny Policy:
+    // Deny all direct client reads and writes across all other collections and subcollections.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
